@@ -320,7 +320,7 @@ def find_asgs(conn, name=None, tags=None):
             camel_prog = re.compile('(?!^)([A-Z]+)')
 
             for key in ['AutoScalingGroupARN', 'AutoScalingGroupName', 'AvailabilityZones',
-			'DefaultCooldown', 'DesiredCapacity', 'HealthCheckGracePeriod',
+                        'DefaultCooldown', 'DesiredCapacity', 'HealthCheckGracePeriod',
                         'HealthCheckType', 'LaunchConfigurationName', 'LoadBalancerNames',
                         'MaxSize', 'MinSize', 'NewInstancesProtectedFromScaleIn',
                         'PlacementGroup' 'Status', 'TerminationPolicies']:

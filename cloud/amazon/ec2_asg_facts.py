@@ -16,7 +16,7 @@
 
 DOCUMENTATION = '''
 ---
-module: ec2_asg_find
+module: ec2_asg_facts
 short_description: Find auto scaling groups by name and/or tags
 description:
   - Searches for and returns list of matching auto scaling groups with comprehensive details
@@ -37,7 +37,7 @@ options:
     description:
       - If no results are returned, you can return either success (with empty results) or failure.
     required: false
-    default: fail
+    default: success
     choices: [ 'success', 'fail' ]
   limit_results:
     description:
@@ -53,36 +53,36 @@ EXAMPLES = '''
 
 # Find all groups
 - local_acton:
-    module: ec2_asg_find
+    module: ec2_asg_facts
   register: asgs
 
 # Find a group with matching name/prefix
-- ec2_asg_find:
+- ec2_asg_facts:
     name: public-webserver-asg
   register: asgs
 
 # Find a group with matching tags
-- ec2_asg_find:
+- ec2_asg_facts:
     tags:
       project: webapp
       env: production
   register: asgs
 
 # Find a group with matching name/prefix and tags
-- ec2_asg_find:
+- ec2_asg_facts:
     name: myproject
     tags:
       env: production
   register: asgs
 
 # Fail if no groups are found
-- ec2_asg_find:
+- ec2_asg_facts:
     name: public-webserver-asg
     no_result_action: fail
   register: asgs
 
 # Fail if more than the limit of 3 groups is found.
-- ec2_asg_find:
+- ec2_asg_facts:
     name: public-webserver-asg
     no_result_action: fail
     limit_results: 1
@@ -353,7 +353,7 @@ def main():
             tags=dict(type='dict'),
             limit_results=dict(required=False, type='int', default=0),
             no_result_action = dict(
-                required=False, type='str', default='fail',
+                required=False, type='str', default='success',
                 choices = ['success', 'fail']
             ),
         )

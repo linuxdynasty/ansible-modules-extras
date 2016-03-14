@@ -371,12 +371,7 @@ def make_tags_in_aws_format(tags):
         >>> make_tags_in_proper_format(tags)
         [
             {
-                "Value": "web",
-                "Key": "service"
-             },
-            {
-               "Value": "development",
-               "key": "env"
+               "env": "development"
             }
         ]
 

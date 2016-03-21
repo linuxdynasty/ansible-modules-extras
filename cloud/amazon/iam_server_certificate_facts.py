@@ -22,7 +22,7 @@ description:
   - Retrieve the attributes of a server certificate
 version_added: "2.1"
 author: "Allen Sanabria (@linuxdynasty)"
-requirements: ["boto3"]
+requirements: [boto3, botocore]
 options:
   name:
     description:

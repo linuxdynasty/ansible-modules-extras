@@ -20,7 +20,7 @@ module: iam_server_certificate_facts
 short_description: Retrieve the facts of a server certificate
 description:
   - Retrieve the attributes of a server certificate
-version_added: "2.1"
+version_added: "2.2"
 author: "Allen Sanabria (@linuxdynasty)"
 requirements: [boto3, botocore]
 options:

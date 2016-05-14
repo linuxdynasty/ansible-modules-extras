@@ -75,7 +75,7 @@ arn:
   description: The Amazon Resource identifier of the ElastiCache Cluster.
   returned: always
   type: string
-  sample: ""arn:aws:elasticache:us-west-2:1234567898765:cluster:test"
+  sample: "arn:aws:elasticache:us-west-2:1234567898765:cluster:test"
 tags:
   description: Dictionary containing all the tags associated with the Resource Name.
   returned: always

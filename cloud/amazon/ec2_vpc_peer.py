@@ -42,10 +42,11 @@ options:
       - List of route table ids. These route tables will be updated with the
       - CIDR block of the vpc_peer_id using the vpc_peering_id that is generated when the peer is created.
     required: false
-  resource_tags:
+  tags:
     description:
       - Dictionary of Tags to apply to the newly created peer.
     required: false
+    aliases: ['resource_tags']
   vpc_id:
     description:
       - VPC id of the requesting VPC.
@@ -74,7 +75,7 @@ EXAMPLES = '''
     peer_vpc_id: vpc-87654321
     state: present
     accept_peer: yes
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -92,7 +93,7 @@ EXAMPLES = '''
     requester_routes:
       - rtb-12345678
       - rtb-98765432
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -110,7 +111,7 @@ EXAMPLES = '''
     accepter_routes:
       - rtb-12345678
       - rtb-98765432
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -125,7 +126,7 @@ EXAMPLES = '''
     state: present
     accept_with_profile: boto3_profile_goes_here
     peer_owner_id: 12345678910
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -138,7 +139,7 @@ EXAMPLES = '''
     vpc_id: vpc-12345678
     peer_vpc_id: vpc-87654321
     state: present
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -160,7 +161,7 @@ EXAMPLES = '''
     state: present
     accept_with_profile: boto3_profile_goes_here
     peer_owner_id: 12345678910
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -181,7 +182,7 @@ EXAMPLES = '''
     vpc_id: vpc-12345678
     peer_vpc_id: vpc-87654321
     state: present
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -202,7 +203,7 @@ EXAMPLES = '''
     peer_vpc_id: vpc-87654321
     state: present
     peer_owner_id: 12345678910
-    resource_tags:
+    tags:
       - Name: new_peer
       - Env: development
   register: vpc_peer
@@ -1406,16 +1407,16 @@ def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(
         dict(
-            accepter_routes=dict(type='list'),
-            requester_routes=dict(type='list'),
-            vpc_id=dict(),
-            vpc_peer_id=dict(),
-            vpc_peering_id=dict(),
-            peer_owner_id=dict(),
+            accepter_routes=dict(type='list', default=list()),
+            requester_routes=dict(type='list', default=list()),
+            vpc_id=dict(type='str'),
+            vpc_peer_id=dict(type='str'),
+            vpc_peering_id=dict(type='str'),
+            peer_owner_id=dict(type='str'),
             accept_peer=dict(type='bool', default=False),
-            profile=dict(),
-            accept_with_profile=dict(),
-            resource_tags=dict(type='dict'),
+            profile=dict(type='str'),
+            accept_with_profile=dict(type='bool', default=False),
+            tags=dict(type='dict', aliases=['resource_tags']),
             state=dict(
                 default='present', choices=[
                     'present', 'absent', 'accept', 'reject'
@@ -1441,7 +1442,7 @@ def main():
     vpc_peering_id = module.params.get('vpc_peering_id')
     peer_owner_id = module.params.get('peer_owner_id')
     accept_peer = module.params.get('accept_peer')
-    tags = module.params.get('resource_tags')
+    tags = module.params.get('tags')
     state = module.params.get('state').lower()
 
     if tags:
@@ -1449,15 +1450,11 @@ def main():
 
     if state == 'present' and not tags:
         err_msg = "parameters state=present and tags are required together"
-        module.fail_json(
-            success=False, changed=False, result={}, msg=err_msg
-        )
+        module.fail_json(msg=err_msg)
 
     if accept_with_profile and state == 'present' and not accept_peer:
         err_msg = "accept_with_profile can only be used with accept_peer"
-        module.fail_json(
-            success=False, changed=False, result={}, msg=err_msg
-        )
+        module.fail_json(msg=err_msg)
 
     try:
         region, ec2_url, aws_connect_kwargs = (
@@ -1471,16 +1468,12 @@ def main():
         )
     except botocore.exceptions.ClientError, e:
         err_msg = 'Boto3 Client Error - {0}'.format(str(e.msg))
-        module.fail_json(
-            success=False, changed=False, result={}, msg=err_msg
-        )
+        module.fail_json(msg=err_msg, **convert_to_lower(e.response))
 
     if boto_profile:
         client, err_msg = create_client_with_profile(boto_profile, region)
         if err_msg:
-            module.fail_json(
-                success=False, changed=False, result={}, msg=err_msg
-            )
+            module.fail_json(msg=err_msg)
 
     if state == 'accept':
         success, changed, err_msg, results = (
@@ -1530,9 +1523,7 @@ def main():
             success=success, changed=changed, msg=err_msg, **results
         )
     else:
-        module.fail_json(
-            success=success, changed=changed, msg=err_msg, result=results
-        )
+        module.fail_json(msg=err_msg)
 
 
 # import module snippets

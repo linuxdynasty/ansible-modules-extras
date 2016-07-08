@@ -106,80 +106,11 @@ EXAMPLES = '''
   register: nat_route_table
 
 '''
-RETURN = '''
-associations:
-  description: List of subnets attached to this route table with its association id.
-  returned: success
-  type: string
-  sample: [
-      {
-          "subnet_id": "subnet-12345667",
-          "route_table_id": "rtb-1234567",
-          "main": false,
-          "route_table_association_id": "rtbassoc-1234567"
-      },
-      {
-          "subnet_id": "subnet-78654321",
-          "route_table_id": "rtb-78654321",
-          "main": false,
-          "route_table_association_id": "rtbassoc-78654321"
-      }
-  ]
-propagating_vgws:
-  description: List of virtual gateways applied to the route table.
-  returned: success
-  type: string
-  sample: [
-      {
-          'gateway_id': 'vgw-1234567'
-      }
-  ]
-routes:
-  description: List of tags applied to the route table.
-  returned: success
-  type: string
-  sample: [
-      {
-          "gateway_id": "local",
-          "origin": "CreateRouteTable",
-          "state": "active",
-          "destination_cidr_block": "10.100.0.0/16"
-      },
-      {
-          "origin": "CreateRoute",
-          "state": "active",
-          "nat_gateway_id": "nat-12345678",
-          "destination_cidr_block": "0.0.0.0/0"
-      }
-  ]
-tags:
-  description: List of tags applied to the route table.
-  returned: success
-  type: string
-  sample: [
-      {
-          "key": "Name",
-          "value": "dev_route_table"
-      },
-      {
-          "key": "env",
-          "value": "development"
-      }
-  ]
-route_table_id:
-  description: The resource id of an Amazon route table.
-  returned: success
-  type: string
-  sample: "rtb-1234567"
-vpc_id:
-  description: id of the VPC.
-  returned: In all cases.
-  type: string
-  sample: "vpc-12345"
-'''
+
 try:
     import botocore
     import boto3
+    from boto.exception import EC2ResponseError
     HAS_BOTO3 = True
 except ImportError:
     HAS_BOTO3 = False
@@ -187,6 +118,7 @@ except ImportError:
 import re
 import datetime
 from functools import reduce
+from time import sleep
 
 DRY_RUN_MATCH = re.compile(r'DryRun flag is set')
 
@@ -344,7 +276,12 @@ def make_tags_in_proper_format(tags):
         >>> make_tags_in_proper_format(tags)
         [
             {
-               "env": "development"
+                "Value": "web",
+                "Key": "service"
+             },
+            {
+               "Value": "development",
+               "key": "env"
             }
         ]
 
@@ -371,7 +308,12 @@ def make_tags_in_aws_format(tags):
         >>> make_tags_in_proper_format(tags)
         [
             {
-               "env": "development"
+                "Value": "web",
+                "Key": "service"
+             },
+            {
+               "Value": "development",
+               "key": "env"
             }
         ]
 
@@ -585,6 +527,7 @@ def tags_action(client, resource_id, tags, action='create', check_mode=False):
         'Tags': tags,
         'DryRun': check_mode
     }
+    sleep(2)
     try:
         if action == 'create':
             client.create_tags(**params)
@@ -845,48 +788,6 @@ def subnet_action(client, route_table_id, subnet_id=None, association_id=None,
             success = True
             err_msg = e.message
         else:
-<<<<<<< 5a3dc054bd897e24749d69da41dcb9168c31c538
-            del routes_to_match[i]
-
-    # NOTE: As of boto==2.38.0, the origin of a route is not available
-    # (for example, whether it came from a gateway with route propagation
-    # enabled). Testing for origin == 'EnableVgwRoutePropagation' is more
-    # correct than checking whether the route uses a propagating VGW.
-    # The current logic will leave non-propagated routes using propagating
-    # VGWs in place.
-    routes_to_delete = [r for r in routes_to_match
-                        if r.gateway_id != 'local'
-                        and (propagating_vgw_ids is not None
-                             and r.gateway_id not in propagating_vgw_ids)]
-
-    changed = routes_to_delete or route_specs_to_create
-    if changed:
-        for route_spec in route_specs_to_create:
-            try:
-                vpc_conn.create_route(route_table.id,
-                                      dry_run=check_mode,
-                                      **route_spec)
-            except EC2ResponseError as e:
-                if e.error_code == 'DryRunOperation':
-                    pass
-
-        for route in routes_to_delete:
-            try:
-                vpc_conn.delete_route(route_table.id,
-                                      route.destination_cidr_block,
-                                      dry_run=check_mode)
-            except EC2ResponseError as e:
-                if e.error_code == 'DryRunOperation':
-                    pass
-
-    return {'changed': bool(changed)}
-
-
-def ensure_subnet_association(vpc_conn, vpc_id, route_table_id, subnet_id,
-                              check_mode):
-    route_tables = vpc_conn.get_all_route_tables(
-        filters={'association.subnet_id': subnet_id, 'vpc_id': vpc_id}
-=======
             err_msg = str(e)
 
     return success, err_msg
@@ -929,7 +830,6 @@ def update_subnets(client, vpc_id, route_table_id, current_subnets,
         map(
             lambda subnet: subnet['SubnetId'], current_subnets
         )
->>>>>>> Boto3 compatible and works with Nat Gateways.
     )
     subnet_ids_to_add = (
         list(set(new_subnet_ids).difference(current_subnet_ids))
@@ -1219,7 +1119,7 @@ def update(client, vpc_id, route_table_id, current_route_table, routes=None,
         >>> tags = {'env': 'development', 'Name': 'dev_route_table'}
 
     Returns:
-        Tuple (bool, bool, str, dict)
+        Tuple (bool, str)
     """
     success = True
     err_msg = ''
@@ -1446,12 +1346,13 @@ def create_route_table(client, vpc_id, routes, subnets, tags, vgw_id=None,
         )
         if route_table_success:
             route_table_id = route_table['RouteTableId']
-            success, changed, err_msg, results = (
+            success, err_msg = (
                 update(
                     client, vpc_id, route_table_id, route_table, routes,
                     subnets, tags, vgw_id, check_mode
                 )
             )
+            changed = True
             if success:
                 err_msg = 'Route table {0} created.'.format(route_table_id)
             return success, changed, err_msg, convert_to_lower(results)

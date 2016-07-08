@@ -19,18 +19,21 @@ module: ec2_vpc_route_table
 short_description: Manage route tables for AWS virtual private clouds
 description:
     - Manage route tables for AWS virtual private clouds
-version_added: "2.0"
-author: Robert Estelle (@erydo), Rob White (@wimnat)
+version_added: "2.1"
+author: Robert Estelle (@erydo), Rob White (@wimnat), Allen Sanabria (@linuxdynasty)
 options:
   lookup:
     description:
-      - "Look up route table by either tags or by route table ID. Non-unique tag lookup will fail. If no tags are specifed then no lookup for an existing route table is performed and a new route table will be created. To change tags of a route table, you must look up by id."
+      - "This option is deprecated. Tags are manadatory when creating a route
+      table. If a route table id is specified, then that will be use. Otherwise, this module will perform an exact match for all the tags applied. If a match is not found, it will than search by tag Name."
+      - "Look up route table by either tags or by route table ID. Non-unique
+      tag lookup will fail. If no tags are specifed then no lookup for an existing route table is performed and a new route table will be created. To change tags of a route table, you must look up by id."
     required: false
     default: tag
     choices: [ 'tag', 'id' ]
   propagating_vgw_ids:
     description:
-      - "Enable route propagation from virtual gateways specified by ID."
+      - "Enable route propagation from virtual gateways specified by ID. Only 1 virtual gateway can only be applied to a vpc at a time."
     default: None
     required: false
   route_table_id:
@@ -40,7 +43,8 @@ options:
     default: null
   routes:
     description:
-      - "List of routes in the route table. Routes are specified as dicts containing the keys 'dest' and one of 'gateway_id', 'instance_id', 'interface_id', or 'vpc_peering_connection_id'. If 'gateway_id' is specified, you can refer to the VPC's IGW by using the value 'igw'."
+      - "List of routes in the route table. Routes are specified as dicts
+      containing the keys 'dest' and one of 'gateway_id', 'instance_id', 'nat_gateway_id', interface_id', or 'vpc_peering_connection_id'. If 'gateway_id' is specified, you can refer to the VPC's IGW by using the value 'igw'."
     required: true
   state:
     description:
@@ -102,213 +106,756 @@ EXAMPLES = '''
   register: nat_route_table
 
 '''
-
-
-import sys  # noqa
-import re
-
+RETURN = '''
+associations:
+  description: List of subnets attached to this route table with its association id.
+  returned: success
+  type: string
+  sample: [
+      {
+          "subnet_id": "subnet-12345667",
+          "route_table_id": "rtb-1234567",
+          "main": false,
+          "route_table_association_id": "rtbassoc-1234567"
+      },
+      {
+          "subnet_id": "subnet-78654321",
+          "route_table_id": "rtb-78654321",
+          "main": false,
+          "route_table_association_id": "rtbassoc-78654321"
+      }
+  ]
+propagating_vgws:
+  description: List of virtual gateways applied to the route table.
+  returned: success
+  type: string
+  sample: [
+      {
+          'gateway_id': 'vgw-1234567'
+      }
+  ]
+routes:
+  description: List of tags applied to the route table.
+  returned: success
+  type: string
+  sample: [
+      {
+          "gateway_id": "local",
+          "origin": "CreateRouteTable",
+          "state": "active",
+          "destination_cidr_block": "10.100.0.0/16"
+      },
+      {
+          "origin": "CreateRoute",
+          "state": "active",
+          "nat_gateway_id": "nat-12345678",
+          "destination_cidr_block": "0.0.0.0/0"
+      }
+  ]
+tags:
+  description: List of tags applied to the route table.
+  returned: success
+  type: string
+  sample: [
+      {
+          "key": "Name",
+          "value": "dev_route_table"
+      },
+      {
+          "key": "env",
+          "value": "development"
+      }
+  ]
+route_table_id:
+  description: The resource id of an Amazon route table.
+  returned: success
+  type: string
+  sample: "rtb-1234567"
+vpc_id:
+  description: id of the VPC.
+  returned: In all cases.
+  type: string
+  sample: "vpc-12345"
+'''
 try:
-    import boto.ec2
-    import boto.vpc
-    from boto.exception import EC2ResponseError
-    HAS_BOTO = True
+    import botocore
+    import boto3
+    HAS_BOTO3 = True
 except ImportError:
-    HAS_BOTO = False
-    if __name__ != '__main__':
-        raise
+    HAS_BOTO3 = False
 
+import re
+import datetime
+from functools import reduce
 
-class AnsibleRouteTableException(Exception):
-    pass
+DRY_RUN_MATCH = re.compile(r'DryRun flag is set')
 
+def convert_to_lower(data):
+    """Convert all uppercase keys in dict with lowercase_
+    Args:
+        data (dict): Dictionary with keys that have upper cases in them
+            Example.. NatGatewayAddresses == nat_gateway_addresses
+            if a val is of type datetime.datetime, it will be converted to
+            the ISO 8601
 
-class AnsibleIgwSearchException(AnsibleRouteTableException):
-    pass
+    Basic Usage:
+        >>> test = {'NatGatewaysAddresses': []}
+        >>> test = convert_to_lower(test)
+        {
+            'nat_gateways_addresses': []
+        }
 
-
-class AnsibleTagCreationException(AnsibleRouteTableException):
-    pass
-
-
-class AnsibleSubnetSearchException(AnsibleRouteTableException):
-    pass
-
-CIDR_RE = re.compile('^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$')
-SUBNET_RE = re.compile('^subnet-[A-z0-9]+$')
-ROUTE_TABLE_RE = re.compile('^rtb-[A-z0-9]+$')
-
-
-def find_subnets(vpc_conn, vpc_id, identified_subnets):
+    Returns:
+        Dictionary
     """
-    Finds a list of subnets, each identified either by a raw ID, a unique
-    'Name' tag, or a CIDR such as 10.0.0.0/8.
+    results = dict()
+    if isinstance(data, dict):
+        for key, val in data.items():
+            key = re.sub('([A-Z]{1})', r'_\1', key).lower()
+            if key[0] == '_':
+                key = key[1:]
+            if isinstance(val, datetime.datetime):
+                results[key] = val.isoformat()
+            elif isinstance(val, dict):
+                results[key] = convert_to_lower(val)
+            elif isinstance(val, list):
+                converted = list()
+                for item in val:
+                    converted.append(convert_to_lower(item))
+                results[key] = converted
+            else:
+                results[key] = val
+    return results
 
-    Note that this function is duplicated in other ec2 modules, and should
-    potentially be moved into potentially be moved into a shared module_utils
+GATEWAY_MAP = {
+    'gateway_id': 'GatewayId',
+    'instance_id': 'InstanceId',
+    'network_interface_id': 'NetworkInterfaceId',
+    'vpc_peering_connection_id': 'VpcPeeringConnectionId',
+    'nat_gateway_id': 'NatGatewayId',
+}
+
+def valid_gateway_types():
+    """List of currently supported gateway types in Boto3
+
+    Basic Usage
+        >>> valid_gateway_types()
+
+    Returns:
+        List
     """
-    subnet_ids = []
-    subnet_names = []
-    subnet_cidrs = []
-    for subnet in (identified_subnets or []):
-        if re.match(SUBNET_RE, subnet):
-            subnet_ids.append(subnet)
-        elif re.match(CIDR_RE, subnet):
-            subnet_cidrs.append(subnet)
-        else:
-            subnet_names.append(subnet)
+    return  [
+        'gateway_id',
+        'instance_id',
+        'network_interface_id',
+        'vpc_peering_connection_id',
+        'nat_gateway_id'
+    ]
 
-    subnets_by_id = []
-    if subnet_ids:
-        subnets_by_id = vpc_conn.get_all_subnets(
-            subnet_ids, filters={'vpc_id': vpc_id})
+def valid_route_type(route):
+    """Validate if dictionary contains a valid gateway key.
 
-        for subnet_id in subnet_ids:
-            if not any(s.id == subnet_id for s in subnets_by_id):
-                raise AnsibleSubnetSearchException(
-                    'Subnet ID "{0}" does not exist'.format(subnet_id))
+    Args:
+        route (dict): Dictionary containing the route information.
 
-    subnets_by_cidr = []
-    if subnet_cidrs:
-        subnets_by_cidr = vpc_conn.get_all_subnets(
-            filters={'vpc_id': vpc_id, 'cidr': subnet_cidrs})
+    Basic Usage:
+        >>> route = {'dest': '0.0.0.0/0', 'nat_gateway_id': 'ngw-123456789'}
+        >>> success, key = valid_route_type(route)
 
-        for cidr in subnet_cidrs:
-            if not any(s.cidr_block == cidr for s in subnets_by_cidr):
-                raise AnsibleSubnetSearchException(
-                    'Subnet CIDR "{0}" does not exist'.format(subnet_cidr))
-
-    subnets_by_name = []
-    if subnet_names:
-        subnets_by_name = vpc_conn.get_all_subnets(
-            filters={'vpc_id': vpc_id, 'tag:Name': subnet_names})
-
-        for name in subnet_names:
-            matching = [s.tags.get('Name') == name for s in subnets_by_name]
-            if len(matching) == 0:
-                raise AnsibleSubnetSearchException(
-                    'Subnet named "{0}" does not exist'.format(name))
-            elif len(matching) > 1:
-                raise AnsibleSubnetSearchException(
-                    'Multiple subnets named "{0}"'.format(name))
-
-    return subnets_by_id + subnets_by_cidr + subnets_by_name
-
-
-def find_igw(vpc_conn, vpc_id):
+    Returns:
+        Tuple (bool, str)
     """
-    Finds the Internet gateway for the given VPC ID.
+    success = False
+    for key, val in route.items():
+        if key != 'dest' and key in valid_gateway_types():
+            success = True
+            return success, key
+        elif key != 'dest' and key not in valid_gateway_types():
+            return success, key
 
-    Raises an AnsibleIgwSearchException if either no IGW can be found, or more
-    than one found for the given VPC.
+def validate_routes(routes):
+    """Validate if all of the routes contain valid gateway keys.
+    Args:
+        routes (list): List of routes.
 
-    Note that this function is duplicated in other ec2 modules, and should
-    potentially be moved into potentially be moved into a shared module_utils
+    Basic Usage:
+        >>> routes = [{'dest': '0.0.0.0/0', 'nat_gateway_id': 'ngw-123456789'}]
+        >>> success, err_msg = validate_routes(routes)
+
+    Returns:
+        Tuple (bool, str)
     """
-    igw = vpc_conn.get_all_internet_gateways(
-        filters={'attachment.vpc-id': vpc_id})
+    success = True
+    err_msg = ''
+    for route in routes:
+        success, route_type = valid_route_type(route)
+        if not success:
+            err_msg = '{0} is not a valid gateway type'.format(route_type)
+    return success, err_msg
 
-    if not igw:
-        raise AnsibleIgwSearchException('No IGW found for VPC {0}'.
-                                         format(vpc_id))
-    elif len(igw) == 1:
-        return igw[0].id
-    else:
-        raise AnsibleIgwSearchException('Multiple IGWs found for VPC {0}'.
-                                        format(vpc_id))
+def route_keys(client, vpc_id, routes, check_mode=False):
+    """Return a new list containing updated keys.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The vpc_id of the vpc.
+        routes (list): List of routes.
 
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> routes = [{'dest': '0.0.0.0/0', 'nat_gateway_id': 'ngw-123456789'}]
+        >>> new_routes = route_keys(client, vpc_id, routes)
+        [
+            {
+                'dest': '0.0.0.0/0',
+                'id': 'ngw-123456789',
+                'gateway_type': 'nat_gateway_id'
+            }
+        ]
 
-def get_resource_tags(vpc_conn, resource_id):
-    return dict((t.name, t.value) for t in
-                vpc_conn.get_all_tags(filters={'resource-id': resource_id}))
+    Returns:
+        List
+    """
+    new_routes = list()
+    for route in routes:
+        info = dict()
+        for key, val in route.items():
+            if key != 'dest' and key in valid_gateway_types():
+                if key == 'gateway_id' and val == 'igw':
+                    igw_success, igw_msg, igw_id = (
+                        find_igw(client, vpc_id, check_mode=check_mode)
+                    )
+                    if igw_success and igw_id:
+                        val = igw_id
+                info['id'] = val
+                info['gateway_type'] = key
+            elif key == 'dest':
+                info['dest'] = val
+        new_routes.append(info)
+    return new_routes
 
+def make_tags_in_proper_format(tags):
+    """Take a dictionary of tags and convert them into the AWS Tags format.
+    Args:
+        tags (list): The tags you want applied.
 
-def tags_match(match_tags, candidate_tags):
-    return all((k in candidate_tags and candidate_tags[k] == v
-                for k, v in match_tags.iteritems()))
+    Basic Usage:
+        >>> tags = [{u'Key': 'env', u'Value': 'development'}]
+        >>> make_tags_in_proper_format(tags)
+        [
+            {
+                "Value": "web",
+                "Key": "service"
+             },
+            {
+               "Value": "development",
+               "key": "env"
+            }
+        ]
 
+    Returns:
+        List
+    """
+    formatted_tags = list()
+    for tag in tags:
+        formatted_tags.append(
+            {
+                tag.get('Key'): tag.get('Value')
+            }
+        )
 
-def ensure_tags(vpc_conn, resource_id, tags, add_only, check_mode):
-    try:
-        cur_tags = get_resource_tags(vpc_conn, resource_id)
-        if tags == cur_tags:
-            return {'changed': False, 'tags': cur_tags}
+    return formatted_tags
 
-        to_delete = dict((k, cur_tags[k]) for k in cur_tags if k not in tags)
-        if to_delete and not add_only:
-            vpc_conn.delete_tags(resource_id, to_delete, dry_run=check_mode)
+def make_tags_in_aws_format(tags):
+    """Take a dictionary of tags and convert them into the AWS Tags format.
+    Args:
+        tags (dict): The tags you want applied.
 
-        to_add = dict((k, tags[k]) for k in tags if k not in cur_tags)
-        if to_add:
-            vpc_conn.create_tags(resource_id, to_add, dry_run=check_mode)
+    Basic Usage:
+        >>> tags = {'env': 'development', 'service': 'web'}
+        >>> make_tags_in_proper_format(tags)
+        [
+            {
+                "Value": "web",
+                "Key": "service"
+             },
+            {
+               "Value": "development",
+               "key": "env"
+            }
+        ]
 
-        latest_tags = get_resource_tags(vpc_conn, resource_id)
-        return {'changed': True, 'tags': latest_tags}
-    except EC2ResponseError as e:
-        raise AnsibleTagCreationException(
-            'Unable to update tags for {0}, error: {1}'.format(resource_id, e))
+    Returns:
+        List
+    """
+    formatted_tags = list()
+    for key, val in tags.items():
+        formatted_tags.append({
+            'Key': key,
+            'Value': val
+        })
 
+    return formatted_tags
 
-def get_route_table_by_id(vpc_conn, vpc_id, route_table_id):
+def find_igw(client, vpc_id, check_mode=False):
+    """Find an Internet Gateway for a VPC.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The vpc_id of the vpc.
 
-    route_table = None
-    route_tables = vpc_conn.get_all_route_tables(route_table_ids=[route_table_id], filters={'vpc_id': vpc_id})
-    if route_tables:
-        route_table = route_tables[0]
+    Kwargs:
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
 
-    return route_table
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> find_igw(client, vpc_id)
 
-def get_route_table_by_tags(vpc_conn, vpc_id, tags):
-
-    count = 0
-    route_table = None
-    route_tables = vpc_conn.get_all_route_tables(filters={'vpc_id': vpc_id})
-    for table in route_tables:
-        this_tags = get_resource_tags(vpc_conn, table.id)
-        if tags_match(tags, this_tags):
-            route_table = table
-            count +=1
-
-    if count > 1:
-        raise RuntimeError("Tags provided do not identify a unique route table")
-    else:
-        return route_table
-
-
-def route_spec_matches_route(route_spec, route):
-    key_attr_map = {
-        'destination_cidr_block': 'destination_cidr_block',
-        'gateway_id': 'gateway_id',
-        'instance_id': 'instance_id',
-        'interface_id': 'interface_id',
-        'vpc_peering_connection_id': 'vpc_peering_connection_id',
+    Returns:
+        Tuple (bool, str, str)
+    """
+    err_msg = ''
+    success = False
+    igw_id = None
+    params = {
+        'DryRun': check_mode,
+        'Filters': [
+            {
+                'Name': 'attachment.vpc-id',
+                'Values': [vpc_id],
+            }
+        ]
     }
-    for k in key_attr_map.iterkeys():
-        if k in route_spec:
-            if route_spec[k] != getattr(route, k):
-                return False
-    return True
-
-
-def rename_key(d, old_key, new_key):
-    d[new_key] = d[old_key]
-    del d[old_key]
-
-
-def index_of_matching_route(route_spec, routes_to_match):
-    for i, route in enumerate(routes_to_match):
-        if route_spec_matches_route(route_spec, route):
-            return i
-
-
-def ensure_routes(vpc_conn, route_table, route_specs, propagating_vgw_ids,
-                  check_mode):
-    routes_to_match = list(route_table.routes)
-    route_specs_to_create = []
-    for route_spec in route_specs:
-        i = index_of_matching_route(route_spec, routes_to_match)
-        if i is None:
-            route_specs_to_create.append(route_spec)
+    try:
+        results = (
+            client.describe_internet_gateways(**params)['InternetGateways']
+        )
+        if len(results) == 1:
+            success = True
+            igw_id = results[0]['InternetGatewayId']
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
         else:
+            err_msg = str(e)
+
+    return success, err_msg, igw_id
+
+def find_subnet_associations(client, vpc_id, subnet_ids, check_mode=False):
+    """Find all route tables that contain the subnet_ids within vpc_id.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The vpc_id of the vpc.
+        subnet_ids (list): List of subnet_ids.
+
+    Kwargs:
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> subnet_ids = ['subnet-1234567', 'subnet-7654321']
+        >>> find_subnet_associations(client, vpc_id, subnet_ids)
+
+    Returns:
+        Tuple (bool, str, list)
+    """
+    err_msg = ''
+    success = False
+    results = list()
+    params = {
+        'DryRun': check_mode,
+        'Filters': [
+            {
+                'Name': 'vpc-id',
+                'Values': [vpc_id],
+            },
+            {
+                'Name': 'association.subnet-id',
+                'Values': subnet_ids
+            }
+        ]
+    }
+    try:
+        results = client.describe_route_tables(**params)['RouteTables']
+        success = True
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
+        else:
+            err_msg = str(e)
+
+    return success, err_msg, results
+
+def find_route_table(client, vpc_id, tags=None, route_table_id=None,
+                     check_mode=False):
+    """Find a route table in a vpc by either the route_table_id or by matching
+        the exact list of tags that were passed.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The vpc_id of the vpc.
+
+    Kwargs:
+        tags (dict): Dictionary containing the tags you want to search by.
+        route_table_id (str): The route table id.
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> tags = {'Name': 'Public-Route-Table-A'}
+        >>> find_route_table(client, vpc_id, tags=tags)
+
+    Returns:
+        Tuple (bool, str, list)
+    """
+
+    err_msg = ''
+    success = False
+    results = dict()
+    params = {
+        'DryRun': check_mode,
+        'Filters': [
+            {
+                'Name': 'vpc-id',
+                'Values': [vpc_id],
+            }
+        ]
+    }
+    if tags and not route_table_id:
+        for key, val in tags.items():
+            params['Filters'].append(
+                {
+                    'Name': 'tag:{0}'.format(key),
+                    'Values': [ val ]
+                }
+            )
+    elif route_table_id and not tags:
+        params['RouteTableIds'] = [route_table_id]
+
+    elif route_table_id and tags:
+        #If route table id is passed with tags, use route_table_id
+        params['RouteTableIds'] = [route_table_id]
+    else:
+        err_msg = 'Must lookup by tag or by id'
+
+    try:
+        results = client.describe_route_tables(**params)['RouteTables']
+        if len(results) == 1:
+            results = results[0]
+            success = True
+        elif len(results) > 1:
+            err_msg = 'More than 1 route found'
+        else:
+            err_msg = 'No routes found'
+            success = True
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
+        else:
+            err_msg = str(e)
+
+    return success, err_msg, results
+
+def tags_action(client, resource_id, tags, action='create', check_mode=False):
+    """Create or delete multiple tags from an Amazon resource id
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        resource_id (str): The Amazon resource id.
+        tags (list): List of dictionaries.
+            examples.. [{Name: "", Values: [""]}]
+
+    Kwargs:
+        action (str): The action to perform.
+            valid actions == create and delete
+            default=create
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> resource_id = 'pcx-123345678'
+        >>> tags = [{'Name': 'env', 'Values': ['Development']}]
+        >>> update_tags(client, resource_id, tags)
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    success = False
+    err_msg = ""
+    params = {
+        'Resources': [resource_id],
+        'Tags': tags,
+        'DryRun': check_mode
+    }
+    try:
+        if action == 'create':
+            client.create_tags(**params)
+            success = True
+        elif action == 'delete':
+            client.delete_tags(**params)
+            success = True
+        else:
+            err_msg = 'Invalid action {0}'.format(action)
+
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
+        else:
+            err_msg = str(e)
+
+    return success, err_msg
+
+def recreate_tags_from_list(list_of_tags):
+    """Recreate tags from a list of tuples into the Amazon Tag format.
+    Args:
+        list_of_tags (list): List of tuples.
+
+    Basic Usage:
+        >>> list_of_tags = [('Env', 'Development')]
+        >>> recreate_tags_from_list(list_of_tags)
+        [
+            {
+                "Value": "Development",
+                "Key": "Env"
+            }
+        ]
+
+    Returns:
+        List
+    """
+    tags = list()
+    i = 0
+    list_of_tags = list_of_tags
+    for i in range(len(list_of_tags)):
+        key_name = list_of_tags[i][0]
+        key_val = list_of_tags[i][1]
+        tags.append(
+            {
+                'Key': key_name,
+                'Value': key_val
+            }
+        )
+    return tags
+
+def update_tags(client, resource_id, current_tags, tags, check_mode=False):
+    """Update tags for an amazon resource.
+    Args:
+        resource_id (str): The Amazon resource id.
+        current_tags (list): List of dictionaries.
+            examples.. [{Name: "", Values: [""]}]
+        tags (list): List of dictionaries.
+            examples.. [{Name: "", Values: [""]}]
+
+    Kwargs:
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> resource_id = 'pcx-123345678'
+        >>> tags = [{'Name': 'env', 'Values': ['Development']}]
+        >>> update_tags(client, resource_id, tags)
+        [True, '']
+
+    Return:
+        Tuple (bool, str)
+    """
+    success = False
+    err_msg = ''
+    if current_tags:
+        current_tags_set = (
+            set(
+                reduce(
+                    lambda x, y: x + y,
+                    [x.items() for x in make_tags_in_proper_format(current_tags)]
+                )
+            )
+        )
+
+        new_tags_set = (
+            set(
+                reduce(
+                    lambda x, y: x + y,
+                    [x.items() for x in make_tags_in_proper_format(tags)]
+                )
+            )
+        )
+        tags_to_delete = list(current_tags_set.difference(new_tags_set))
+        tags_to_update = list(new_tags_set.difference(current_tags_set))
+        if tags_to_delete:
+            tags_to_delete = recreate_tags_from_list(tags_to_delete)
+            delete_success, delete_msg = (
+                tags_action(
+                    client, resource_id, tags_to_delete, action='delete',
+                    check_mode=check_mode
+                )
+            )
+            if not delete_success:
+                return delete_success, delete_msg
+        if tags_to_update:
+            tags = recreate_tags_from_list(tags_to_update)
+        else:
+            return True, 'Tags do not need to be updated'
+
+    if tags:
+        create_success, create_msg = (
+            tags_action(
+                client, resource_id, tags, action='create',
+                check_mode=check_mode
+            )
+        )
+        return create_success, create_msg
+
+    return success, err_msg
+
+def vgw_action(client, route_table_id, vgw_id, action='create'):
+    """Enable or disable multiple a virtual gateway from an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        route_table_id (str): The Amazon resource id.
+        vgw_id (str): The virtual gateway id.
+
+    Kwargs:
+        action (str): The action to perform.
+            valid actions == create and delete
+            default=create
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> route_table_id = 'rtb-123345678'
+        >>> vgw_id = 'vgw-1234567'
+        >>> vgw_action(client, route_table_id, vgw_id, 'create')
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    success = False
+    err_msg = ''
+    params = {
+        'GatewayId': vgw_id,
+        'RouteTableId': route_table_id,
+    }
+    try:
+        if action == 'create':
+            client.enable_vgw_route_propagation(**params)
+            success = True
+        elif action == 'delete':
+            client.disable_vgw_route_propagation(**params)
+            success = True
+        else:
+            err_msg = 'Invalid action {0}'.format(action)
+
+    except botocore.exceptions.ClientError, e:
+        err_msg = str(e)
+
+    return success, err_msg
+
+def update_vgw(client, route_table_id, current_vgws, vgw_id=None):
+    """Update the virtual gateway status on an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        route_table_id (str): The Amazon resource id.
+        current_vgws (list): List, containing enabled virtual gateways.
+        vgw_id (str): The virtual gateway id you want to keep enabled.
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> route_table_id = 'rtb-123345678'
+        >>> current_vgws = [{u'GatewayId': 'vgw-1234567'}]
+        >>> vgw_id = 'vgw-1234567'
+        >>> update_vgw(client, route_table_id, current_vgws, vgw_id)
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    success = True
+    err_msg = ''
+    if current_vgws:
+        for vgws in current_vgws:
+            for vgw in vgws.values():
+                if vgw != vgw_id or not vgw_id:
+                    if not vgw_id:
+                       vgw_to_delete_id = vgw
+                    else:
+                        vgw_to_delete_id = vgw_id
+                    disable_success, disable_msg = (
+                        vgw_action(
+                            client, route_table_id, vgw_to_delete_id, 'delete'
+                        )
+                    )
+                    if vgw_id and disable_success:
+                        enable_success, enable_msg = (
+                            vgw_action(client, route_table_id, vgw_id)
+                        )
+                        return enable_success, enable_msg
+                    else:
+                        return disable_success, disable_msg
+    elif not current_vgws and vgw_id:
+        enable_success, enable_msg = (
+            vgw_action(client, route_table_id, vgw_id)
+        )
+        return enable_success, enable_msg
+    return success, err_msg
+
+def subnet_action(client, route_table_id, subnet_id=None, association_id=None,
+                  action='create', check_mode=False):
+    """Associate or Disasscoiate subnet_id from an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        route_table_id (str): The Amazon resource id for a route table.
+
+    Kwargs:
+        subnet_id (str): The Amazon resource id for a subnet.
+        association_id (str): The Amazon resource id for an association.
+        action (str): The action to perform.
+            valid actions == create and delete
+            default=create
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> route_table_id = 'rtb-123345678'
+        >>> subnet_id = 'subnet-1234567'
+        >>> subnet_action(client, route_table_id, subnet_id, 'create')
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    success = False
+    err_msg = ''
+    params = {
+        'DryRun': check_mode
+    }
+    try:
+        if action == 'create':
+            params['SubnetId'] = subnet_id
+            params['RouteTableId'] = route_table_id
+            client.associate_route_table(**params)
+            success = True
+        elif action == 'delete':
+            params['AssociationId'] = association_id
+            client.disassociate_route_table(**params)
+            success = True
+        else:
+            err_msg = 'Invalid action {0}'.format(action)
+
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
+        else:
+<<<<<<< 5a3dc054bd897e24749d69da41dcb9168c31c538
             del routes_to_match[i]
 
     # NOTE: As of boto==2.38.0, the origin of a route is not available
@@ -349,214 +896,613 @@ def ensure_subnet_association(vpc_conn, vpc_id, route_table_id, subnet_id,
                               check_mode):
     route_tables = vpc_conn.get_all_route_tables(
         filters={'association.subnet_id': subnet_id, 'vpc_id': vpc_id}
+=======
+            err_msg = str(e)
+
+    return success, err_msg
+
+def update_subnets(client, vpc_id, route_table_id, current_subnets,
+                  new_subnet_ids, check_mode=False):
+    """Update the associated subnets on an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The Amazon resource id of the vpc.
+        route_table_id (str): The Amazon resource id of the route table.
+        current_subnets (list): List, containing the current subnets.
+        new_subnet_ids (str): List, containing the new subnet ids you want
+            associated with this route table.
+
+    Kwargs:
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> route_table_id = 'rtb-123345678'
+        >>> current_subnets = [
+            {
+                u'SubnetId': 'subnet-1234567',
+                u'RouteTableAssociationId': 'rtbassoc-1234567',
+                u'Main': False,
+                u'RouteTableId': 'rtb-1234567'
+            }
+        ]
+        >>> subnet_ids = ['subnet-7654321', 'subnet-243567']
+        >>> update_subnets(client, vpc_id, route_table_id, current_subnets, subnet_ids)
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    current_subnet_ids = (
+        map(
+            lambda subnet: subnet['SubnetId'], current_subnets
+        )
+>>>>>>> Boto3 compatible and works with Nat Gateways.
     )
-    for route_table in route_tables:
-        if route_table.id is None:
-            continue
-        for a in route_table.associations:
-            if a.subnet_id == subnet_id:
-                if route_table.id == route_table_id:
-                    return {'changed': False, 'association_id': a.id}
+    subnet_ids_to_add = (
+        list(set(new_subnet_ids).difference(current_subnet_ids))
+    )
+    subnet_ids_to_remove = (
+        list(set(current_subnet_ids).difference(new_subnet_ids))
+    )
+    association_ids_to_remove = list()
+    for subnet_id in subnet_ids_to_remove:
+        for subnet in current_subnets:
+            subnet = convert_to_lower(subnet)
+            if subnet_id == subnet['subnet_id']:
+                association_ids_to_remove.append(
+                    subnet['route_table_association_id']
+                )
+
+    success, err_msg, routes = (
+        find_subnet_associations(
+            client, vpc_id, subnet_ids_to_add, check_mode=check_mode
+        )
+    )
+    association_ids_to_remove_before_adding = list()
+    if success:
+        for route in routes:
+            for association in route['Associations']:
+                association_ids_to_remove_before_adding.append(
+                    association['RouteTableAssociationId']
+                )
+        for association_id in association_ids_to_remove_before_adding:
+            delete_success, delete_msg = (
+                subnet_action(
+                    client, route_table_id, association_id=association_id,
+                    action='delete', check_mode=check_mode
+                )
+            )
+            if not delete_success:
+                return delete_success, delete_msg
+
+    for subnet_id in subnet_ids_to_add:
+        create_success, create_msg = (
+            subnet_action(
+                client, route_table_id, subnet_id, action='create',
+                check_mode=check_mode
+            )
+        )
+        if not create_success:
+            return create_success, create_msg
+
+    for association_id in association_ids_to_remove:
+        delete_success, delete_msg = (
+            subnet_action(
+                client, route_table_id, association_id=association_id,
+                action='delete', check_mode=False
+            )
+        )
+        if not delete_success:
+            return delete_success, delete_msg
+
+    return True, ''
+
+def route_table_action(client, vpc_id=None, route_table_id=None,
+                       action='create', check_mode=False):
+    """Create or Delete an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+
+    Kwargs:
+        vpc_id (str): The Amazon resource id for a vpc.
+        route_table_id (str): The Amazon resource id for a route table.
+        action (str): The action to perform.
+            valid actions == create and delete
+            default=create
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-123345678'
+        >>> route_table_action(client, vpc_id, 'create')
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    success = False
+    err_msg = ''
+    route_table = dict()
+    params = {
+        'DryRun': check_mode
+    }
+    try:
+        if action == 'create' and vpc_id:
+            params['VpcId'] = vpc_id
+            route_table = client.create_route_table(**params)['RouteTable']
+            success = True
+        elif action == 'delete' and route_table_id:
+            params['RouteTableId'] = route_table_id
+            client.delete_route_table(**params)
+            success = True
+        elif action == 'create' and not vpc_id:
+            err_msg = 'Action create needs parameter vpc_id'
+        elif action == 'delete' and not route_table_id:
+            err_msg = 'Action delete needs parameter route_table_id'
+        else:
+            err_msg = 'Invalid action {0}'.format(action)
+
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
+        else:
+            err_msg = str(e)
+
+    return success, err_msg, route_table
+
+def route_action(client, route, route_table_id, action='create',
+                 check_mode=False):
+    """Create or Delete a route on an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        route (dict): Dictionary, containing the necessary data for a route.
+        route_table_id (str): The Amazon resource id for a route table.
+
+    Kwargs:
+        action (str): The action to perform.
+            valid actions == create and delete
+            default=create
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> route = {
+            'dest': '0.0.0.0/0',
+            'gateway_type': 'nat_gateway_id',
+            'id': 'ngw-12345678'
+        }
+        >>> route_table_id = 'rtb-123345678'
+        >>> route_action(client, route, route_table_id, 'create')
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    success = False
+    err_msg = ''
+    params = {
+        'DestinationCidrBlock': route['dest'],
+        'RouteTableId': route_table_id,
+        'DryRun': check_mode
+    }
+    if action == 'create':
+        params[GATEWAY_MAP[route['gateway_type']]] =  route['id']
+
+    try:
+        if action == 'create':
+            success = client.create_route(**params)['Return']
+        elif action == 'delete':
+            client.delete_route(**params)
+            success = True
+        else:
+            err_msg = 'Invalid action {0}'.format(action)
+
+    except botocore.exceptions.ClientError, e:
+        if e.response['Error']['Code'] == 'DryRunOperation':
+            success = True
+            err_msg = e.message
+        else:
+            err_msg = str(e)
+
+    return success, err_msg
+
+def update_route(client, route_table_id, current_routes, route_to_update,
+                 check_mode=False):
+    """Update the routes on an Amazon route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        route_table_id (str): The Amazon resource id of the route table.
+        current_routes (list): List, containing the current routes.
+        route_to_update (str): List, containing the new subnet ids you want
+            associated with this route table.
+
+    Kwargs:
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> route_table_id = 'rtb-123345678'
+        >>> current_routes = [
+            {
+                u'GatewayId': 'local',
+                u'DestinationCidrBlock': '10.100.0.0/16',
+                u'State': 'active',
+                u'Origin': 'CreateRouteTable'
+            },
+            {
+                u'Origin': 'CreateRoute',
+                u'DestinationCidrBlock': '0.0.0.0/0',
+                u'GatewayId': 'igw-1234567',
+                u'State': 'active'
+            }
+        ]
+        >>> routes_to_update = [
+            {
+                'dest': '0.0.0.0/0',
+                'gateway_type': 'nat_gateway_id',
+                'id': 'nat-987654321'
+            }
+        ]
+        >>> update_route(client, route_table_id, current_routes, routes_to_update)
+        [True, '']
+
+    Returns:
+        List (bool, str)
+    """
+    for route in current_routes:
+        route = convert_to_lower(route)
+        if route['origin'] != 'create_route_table' and len(current_routes) > 1:
+            if route['destination_cidr_block'] == route_to_update['dest']:
+                gateway_key = route_to_update['gateway_type']
+                if route.has_key(gateway_key):
+                    return True, 'route already exists'
                 else:
-                    if check_mode:
-                        return {'changed': True}
-                    vpc_conn.disassociate_route_table(a.id)
+                    delete_success, delete_msg = (
+                        route_action(
+                            client, route_to_update, route_table_id,
+                            'delete', check_mode=check_mode
+                        )
+                    )
+                    if delete_success:
+                        create_success, create_msg = (
+                            route_action(
+                                client, route_to_update, route_table_id,
+                                'create', check_mode=check_mode
+                            )
+                        )
+                        return create_success, create_msg
+                    else:
+                        return delete_success, delete_msg
+        elif len(current_routes) == 1:
+            create_success, create_msg = (
+                route_action(
+                    client, route_to_update, route_table_id,
+                    'create', check_mode
+                )
+            )
+            return create_success, create_msg
 
-    association_id = vpc_conn.associate_route_table(route_table_id, subnet_id)
-    return {'changed': True, 'association_id': association_id}
+def update(client, vpc_id, route_table_id, current_route_table, routes=None,
+           subnets=None, tags=None, vgw_id=None, check_mode=False):
+    """Update the attributes of a route table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The Amazon resource id for a vpc.
+        route_table_id (str): The Amazon resource id of the route table.
+        current_routes (list): List, containing the current routes.
 
+    Kwargs:
+        routes (list): List, containing the necessary data for a route.
+        subnets (str): List, containing the new subnet ids you want
+            associated with this route table.
+        tags (dict): Dictionary containing the tags you want to search by.
+        vgw_id (str): The Virtual Gateway you want to enable.
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
 
-def ensure_subnet_associations(vpc_conn, vpc_id, route_table, subnets,
-                               check_mode):
-    current_association_ids = [a.id for a in route_table.associations]
-    new_association_ids = []
-    changed = False
-    for subnet in subnets:
-        result = ensure_subnet_association(
-            vpc_conn, vpc_id, route_table.id, subnet.id, check_mode)
-        changed = changed or result['changed']
-        if changed and check_mode:
-            return {'changed': True}
-        new_association_ids.append(result['association_id'])
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> current_routes = [
+            {
+                u'GatewayId': 'local',
+                u'DestinationCidrBlock': '10.100.0.0/16',
+                u'State': 'active',
+                u'Origin': 'CreateRouteTable'
+            }
+        ]
+        >>> routes = [
+            {
+                'dest': '0.0.0.0/0',
+                'nat_gateway_id': 'nat-12345678'
+            }
+        ]
+        >>> subnets = ['subnet-1234567', 'subnet-7654321']
+        >>> tags = {'env': 'development', 'Name': 'dev_route_table'}
 
-    to_delete = [a_id for a_id in current_association_ids
-                 if a_id not in new_association_ids]
-
-    for a_id in to_delete:
-        changed = True
-        vpc_conn.disassociate_route_table(a_id, dry_run=check_mode)
-
-    return {'changed': changed}
-
-
-def ensure_propagation(vpc_conn, route_table, propagating_vgw_ids,
-                       check_mode):
-
-    # NOTE: As of boto==2.38.0, it is not yet possible to query the existing
-    # propagating gateways. However, EC2 does support this as shown in its API
-    # documentation. For now, a reasonable proxy for this is the presence of
-    # propagated routes using the gateway in the route table. If such a route
-    # is found, propagation is almost certainly enabled.
-    changed = False
-    for vgw_id in propagating_vgw_ids:
-        for r in list(route_table.routes):
-            if r.gateway_id == vgw_id:
-                return {'changed': False}
-
-        changed = True
-        vpc_conn.enable_vgw_route_propagation(route_table.id,
-                                              vgw_id,
-                                              dry_run=check_mode)
-
-    return {'changed': changed}
-
-
-def ensure_route_table_absent(connection, module):
-
-    lookup = module.params.get('lookup')
-    route_table_id = module.params.get('route_table_id')
-    tags = module.params.get('tags')
-    vpc_id = module.params.get('vpc_id')
-
-    if lookup == 'tag':
-        if tags is not None:
-            try:
-                route_table = get_route_table_by_tags(connection, vpc_id, tags)
-            except EC2ResponseError as e:
-                module.fail_json(msg=e.message)
-            except RuntimeError as e:
-                module.fail_json(msg=e.args[0])
-        else:
-            route_table = None
-    elif lookup == 'id':
-        try:
-            route_table = get_route_table_by_id(connection, vpc_id, route_table_id)
-        except EC2ResponseError as e:
-            module.fail_json(msg=e.message)
-
-    if route_table is None:
-        return {'changed': False}
-
-    try:
-        connection.delete_route_table(route_table.id, dry_run=module.check_mode)
-    except EC2ResponseError as e:
-        if e.error_code == 'DryRunOperation':
-            pass
-        else:
-            module.fail_json(msg=e.message)
-
-    return {'changed': True}
-
-
-def get_route_table_info(route_table):
-
-    # Add any routes to array
-    routes = []
-    for route in route_table.routes:
-        routes.append(route.__dict__)
-
-    route_table_info = { 'id': route_table.id,
-                         'routes': routes,
-                         'tags': route_table.tags,
-                         'vpc_id': route_table.vpc_id
-                       }
-
-    return route_table_info
-
-def create_route_spec(connection, routes, vpc_id):
-
-    for route_spec in routes:
-        rename_key(route_spec, 'dest', 'destination_cidr_block')
-
-        if 'gateway_id' in route_spec and route_spec['gateway_id'] and \
-                route_spec['gateway_id'].lower() == 'igw':
-            igw = find_igw(connection, vpc_id)
-            route_spec['gateway_id'] = igw
-
-    return routes
-
-def ensure_route_table_present(connection, module):
-
-    lookup = module.params.get('lookup')
-    propagating_vgw_ids = module.params.get('propagating_vgw_ids')
-    route_table_id = module.params.get('route_table_id')
-    subnets = module.params.get('subnets')
-    tags = module.params.get('tags')
-    vpc_id = module.params.get('vpc_id')
-    try:
-        routes = create_route_spec(connection, module.params.get('routes'), vpc_id)
-    except AnsibleIgwSearchException as e:
-        module.fail_json(msg=e[0])
-
-    changed = False
-    tags_valid = False
-
-    if lookup == 'tag':
-        if tags is not None:
-            try:
-                route_table = get_route_table_by_tags(connection, vpc_id, tags)
-            except EC2ResponseError as e:
-                module.fail_json(msg=e.message)
-            except RuntimeError as e:
-                module.fail_json(msg=e.args[0])
-        else:
-            route_table = None
-    elif lookup == 'id':
-        try:
-            route_table = get_route_table_by_id(connection, vpc_id, route_table_id)
-        except EC2ResponseError as e:
-            module.fail_json(msg=e.message)
-
-    # If no route table returned then create new route table
-    if route_table is None:
-        try:
-            route_table = connection.create_route_table(vpc_id, module.check_mode)
-            changed = True
-        except EC2ResponseError as e:
-            if e.error_code == 'DryRunOperation':
-                module.exit_json(changed=True)
-
-            module.fail_json(msg=e.message)
-
-    if routes is not None:
-        try:
-            result = ensure_routes(connection, route_table, routes, propagating_vgw_ids, module.check_mode)
-            changed = changed or result['changed']
-        except EC2ResponseError as e:
-            module.fail_json(msg=e.message)
-
-    if propagating_vgw_ids is not None:
-        result = ensure_propagation(connection, route_table,
-                                    propagating_vgw_ids,
-                                    check_mode=module.check_mode)
-        changed = changed or result['changed']
-
-    if not tags_valid and tags is not None:
-        result = ensure_tags(connection, route_table.id, tags,
-                             add_only=True, check_mode=module.check_mode)
-        changed = changed or result['changed']
+    Returns:
+        Tuple (bool, bool, str, dict)
+    """
+    success = True
+    err_msg = ''
+    if tags:
+        tags = make_tags_in_aws_format(tags)
+        tag_success, tag_msg = (
+            update_tags(
+                client, route_table_id, current_route_table['Tags'], tags,
+                check_mode=check_mode
+            )
+        )
+        if not tag_success:
+            success = False
+            return tag_success, tag_msg
 
     if subnets:
-        associated_subnets = []
-        try:
-            associated_subnets = find_subnets(connection, vpc_id, subnets)
-        except EC2ResponseError as e:
-            raise AnsibleRouteTableException(
-                'Unable to find subnets for route table {0}, error: {1}'
-                .format(route_table, e)
+        subnet_success, subnet_msg = (
+            update_subnets(
+                client, vpc_id, route_table_id,
+                current_route_table['Associations'], subnets,
+                check_mode=check_mode
             )
+        )
+        if not subnet_success:
+            success = False
+            return subnet_success, subnet_msg
 
-        try:
-            result = ensure_subnet_associations(connection, vpc_id, route_table, associated_subnets, module.check_mode)
-            changed = changed or result['changed']
-        except EC2ResponseError as e:
-            raise AnsibleRouteTableException(
-                'Unable to associate subnets for route table {0}, error: {1}'
-                .format(route_table, e)
+    if routes:
+        routes = route_keys(client, vpc_id, routes, check_mode)
+        for route in routes:
+            routes_success, routes_msg = (
+                update_route(
+                    client, route_table_id, current_route_table['Routes'],
+                    route, check_mode
+                )
             )
+            if not routes_success:
+                success = False
+                return routes_success, routes_msg
 
-    module.exit_json(changed=changed, route_table=get_route_table_info(route_table))
+    vgw_success, vgw_msg = (
+        update_vgw(
+            client, route_table_id, current_route_table['PropagatingVgws'],
+            vgw_id
+        )
+    )
+    if not vgw_success:
+        success = False
+        return vgw_success, vgw_msg
 
+    return success, err_msg
+
+def pre_create_route_table(client, vpc_id, routes, subnets, tags, vgw_id=None,
+                           route_table_id=None, check_mode=False):
+    """Find route and if it exists update it. If not return back to
+        create_route_table. This should not be called directly, except by
+        create_route_table.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The Amazon resource id for a vpc.
+        routes (list): List, containing the necessary data for a route.
+        subnets (str): List, containing the new subnet ids you want
+            associated with this route table.
+        tags (dict): Dictionary containing the tags you want to search by.
+
+    Kwargs:
+        vgw_id (str): The Virtual Gateway you want to enable.
+        route_table_id (str): The Amazon resource id of the route table.
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> routes = [
+            {
+                'dest': '0.0.0.0/0',
+                'nat_gateway_id': 'nat-12345678'
+            }
+        ]
+        >>> subnets = ['subnet-1234567', 'subnet-7654321']
+        >>> tags = {'env': 'development', 'Name': 'dev_route_table'}
+
+    Returns:
+        Tuple (bool, bool, str, dict)
+    """
+
+    route_table_exist = False
+    route_table = None
+    success, err_msg, route_table = (
+        find_route_table(client, vpc_id, tags, route_table_id, check_mode)
+    )
+    if route_table and success:
+        route_table_exist = True
+
+    if not route_table and not route_table_id:
+        if tags.get('Name', None):
+            tag_wth_name_only = {'Name': tags.get('Name')}
+            success, err_msg, route_table = (
+                find_route_table(
+                    client, vpc_id, tag_wth_name_only, check_mode=check_mode
+                )
+            )
+            if route_table and success:
+                route_table_exist = True
+
+    if route_table_exist:
+        if not route_table_id:
+            route_table_id = route_table['RouteTableId']
+        success, err_msg = (
+            update(
+                client, vpc_id, route_table_id, route_table, routes, subnets,
+                tags, vgw_id, check_mode=check_mode
+            )
+        )
+
+        if success:
+            changed = True
+            success, err_msg, route_table = (
+                find_route_table(
+                    client, vpc_id, tags, route_table_id, check_mode
+                )
+            )
+        else:
+            changed = False
+
+        return success, changed, err_msg, route_table
+
+    else:
+        return False, False, 'Route table does not exist', dict()
+
+def create_route_table(client, vpc_id, routes, subnets, tags, vgw_id=None,
+                       route_table_id=None, check_mode=False):
+    """Create a new route table. If route table is found by id if not
+        by tag, it will then update the existing one.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        vpc_id (str): The Amazon resource id for a vpc.
+        routes (dict): Dictionary, containing the necessary data for a route.
+        subnets (str): List, containing the new subnet ids you want
+            associated with this route table.
+        tags (dict): Dictionary containing the tags you want to search by.
+
+    Kwargs:
+        vgw_id (str): The Virtual Gateway you want to enable.
+        route_table_id (str): The Amazon resource id of the route table.
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> vpc_id = 'vpc-1234567'
+        >>> routes = [
+            {
+                'dest': '0.0.0.0/0',
+                'nat_gateway_id': 'nat-12345678'
+            }
+        ]
+        >>> subnets = ['subnet-1234567', 'subnet-7654321']
+        >>> tags = {'env': 'development', 'Name': 'dev_route_table'}
+        [                                                                                                                                                                                                    [4/967]
+            true,
+            true,
+            "Route table rtb-1234567 updated.",
+            {
+                "associations": [
+                    {
+                        "subnet_id": "subnet-12345667",
+                        "route_table_id": "rtb-1234567",
+                        "main": false,
+                        "route_table_association_id": "rtbassoc-1234567"
+                    },
+                    {
+                        "subnet_id": "subnet-78654321",
+                        "route_table_id": "rtb-78654321",
+                        "main": false,
+                        "route_table_association_id": "rtbassoc-78654321"
+                    }
+                ],
+                "tags": [
+                    {
+                        "key": "Name",
+                        "value": "dev_route_table"
+                    },
+                    {
+                        "key": "env",
+                        "value": "development"
+                    }
+                ],
+                "routes": [
+                    {
+                        "gateway_id": "local",
+                        "origin": "CreateRouteTable",
+                        "state": "active",
+                        "destination_cidr_block": "10.100.0.0/16"
+                    },
+                    {
+                        "origin": "CreateRoute",
+                        "state": "active",
+                        "nat_gateway_id": "nat-12345678",
+                        "destination_cidr_block": "0.0.0.0/0"
+                    }
+                ],
+                "route_table_id": "rtb-1234567",
+                "vpc_id": "vpc-1234567",
+                "propagating_vgws": []
+            }
+        ]
+
+    Returns:
+        Tuple (bool, bool, str, dict)
+    """
+    success, changed, err_msg, results = (
+        pre_create_route_table(
+            client, vpc_id, routes, subnets, tags, vgw_id,
+            route_table_id, check_mode=check_mode
+        )
+    )
+    if not success and not changed and err_msg == 'Route table does not exist':
+        route_table_success, route_table_msg, route_table = (
+            route_table_action(
+                client, vpc_id=vpc_id, action='create', check_mode=check_mode
+            )
+        )
+        if route_table_success:
+            route_table_id = route_table['RouteTableId']
+            success, changed, err_msg, results = (
+                update(
+                    client, vpc_id, route_table_id, route_table, routes,
+                    subnets, tags, vgw_id, check_mode
+                )
+            )
+            if success:
+                err_msg = 'Route table {0} created.'.format(route_table_id)
+            return success, changed, err_msg, convert_to_lower(results)
+
+    else:
+        if success and changed:
+            route_table_id = results['RouteTableId']
+            err_msg = 'Route table {0} updated.'.format(route_table_id)
+        return success, changed, err_msg, convert_to_lower(results)
+
+def delete_route_table(client, route_table_id, check_mode=False):
+    """Create a new route table. If route table is found by id if not
+        by tag, it will then update the existing one.
+    Args:
+        client (botocore.client.EC2): Boto3 client.
+        route_table_id (str): The Amazon resource id of the route table.
+
+    Kwargs:
+        check_mode (bool): This will pass DryRun as one of the parameters to the aws api.
+            default=False
+
+    Basic Usage:
+        >>> client = boto3.client('ec2')
+        >>> route_table_id = 'rtb-1234567'
+        >>> delete_route_table(client, route_table_id)
+
+    Returns:
+        Tuple (bool, bool, str, dict)
+    """
+    success = False
+    changed = False
+    success, err_msg, results = (
+        route_table_action(
+            client, route_table_id=route_table_id, action='delete'
+        )
+    )
+    if success:
+        changed = True
+        err_msg = 'Route table id {0} deleted'.format(route_table_id)
+
+    return success, changed, err_msg, results
 
 def main():
     argument_spec = ec2_argument_spec()
@@ -572,41 +1518,90 @@ def main():
             vpc_id = dict(default=None, required=True)
         )
     )
+    module = AnsibleModule(
+        argument_spec=argument_spec,
+        supports_check_mode=True,
+    )
 
-    module = AnsibleModule(argument_spec=argument_spec, supports_check_mode=True)
-
-    if not HAS_BOTO:
-        module.fail_json(msg='boto is required for this module')
-
-    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
-
-    if region:
-        try:
-            connection = connect_to_aws(boto.vpc, region, **aws_connect_params)
-        except (boto.exception.NoAuthHandlerFound, AnsibleAWSError), e:
-            module.fail_json(msg=str(e))
-    else:
-        module.fail_json(msg="region must be specified")
-
-    lookup = module.params.get('lookup')
+    propagating_vgw_ids = module.params.get('propagating_vgw_ids')
     route_table_id = module.params.get('route_table_id')
-    state = module.params.get('state', 'present')
+    routes = module.params.get('routes')
+    state = module.params.get('state')
+    subnets = module.params.get('subnets')
+    tags = module.params.get('tags')
+    vpc_id = module.params.get('vpc_id')
 
-    if lookup == 'id' and route_table_id is None:
-        module.fail_json("You must specify route_table_id if lookup is set to id")
+    #In order to maintain backward compatability with the original version
+    #I am leaving propagating_vgw_ids parameter as a list. Though you can
+    #only have 1 virtual gateway enabled on a route table.
+    if isinstance(propagating_vgw_ids, list):
+        if len(propagating_vgw_ids) == 1:
+            propagating_vgw_ids = propagating_vgw_ids[0]
+        elif len(propagating_vgw_ids) == 0:
+            propagating_vgw_ids = None
+        else:
+            module.fail_json(
+                success=False, changed=False,
+                msg='propagating_vgw_ids can only take in 1 parameter.'
+            )
 
+    if not HAS_BOTO3:
+        module.fail_json(msg='boto3 is required.')
+
+    check_mode = module.check_mode
     try:
-        if state == 'present':
-            result = ensure_route_table_present(connection, module)
-        elif state == 'absent':
-            result = ensure_route_table_absent(connection, module)
-    except AnsibleRouteTableException as e:
-        module.fail_json(msg=str(e))
+        region, ec2_url, aws_connect_kwargs = (
+            get_aws_connection_info(module, boto3=True)
+        )
+        client = (
+            boto3_conn(
+                module, conn_type='client', resource='ec2',
+                region=region, endpoint=ec2_url, **aws_connect_kwargs
+            )
+        )
+    except botocore.exceptions.ClientError, e:
+        err_msg = 'Boto3 Client Error - {0}'.format(str(e.msg))
+        module.fail_json(
+            success=False, changed=False, result={}, msg=err_msg
+        )
 
-    module.exit_json(**result)
+    if routes:
+        routes_validated, err_msg = validate_routes(routes)
+        if not routes_validated:
+            module.fail_json(
+                success=False, changed=False, result={}, msg=err_msg
+            )
 
-from ansible.module_utils.basic import *  # noqa
-from ansible.module_utils.ec2 import *  # noqa
+    if state == 'present':
+        success, changed, err_msg, results = (
+            create_route_table(
+                client, vpc_id, routes, subnets, tags,
+                propagating_vgw_ids, route_table_id, check_mode
+            )
+        )
+    elif state == 'absent':
+        if route_table_id:
+            success, changed, err_msg, results = (
+                delete_route_table(client, route_table_id)
+            )
+        else:
+            success = False
+            changed = False
+            err_msg = 'When state == absent, you must pass a route_table_id'
+            results = dict()
+
+    if success:
+        module.exit_json(
+            success=success, changed=changed, msg=err_msg, **results
+        )
+    else:
+        module.fail_json(
+            success=success, changed=changed, msg=err_msg, result=results
+        )
+
+# import module snippets
+from ansible.module_utils.basic import *
+from ansible.module_utils.ec2 import *
 
 if __name__ == '__main__':
     main()

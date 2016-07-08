@@ -152,7 +152,7 @@ def main():
     try:
         region, ec2_url, aws_connect_kwargs = get_aws_connection_info(module, boto3=True)
         iam = boto3_conn(module, conn_type='client', resource='iam', region=region, endpoint=ec2_url, **aws_connect_kwargs)
-    except botocore.exceptions.ClientError, e:
+    except botocore.exceptions.ClientError as e:
         module.fail_json(msg="Boto3 Client Error - " + str(e.msg))
 
     cert_name = module.params.get('name')

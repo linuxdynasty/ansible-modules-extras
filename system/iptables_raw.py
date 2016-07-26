@@ -4,7 +4,6 @@
 """
 (c) 2016, Strahinja Kustudic <strahinjak@nordeus.com>
 (c) 2016, Damir Markovic <damir@damirda.com>
-(c) 2016, Allen Sanabria <asanabria@linuxdynasty.org>
 
 This file is part of Ansible
 
@@ -82,12 +81,10 @@ notes:
   - This module saves state in C(/etc/ansible-iptables) directory, so don't modify this directory!
   - Supported distributions are CentOS 5, 6 and 7, but any distribution which loads iptables rules on boot from C(/etc/sysconfig/iptables) should work.
   - IPv6 iptables (ip6tables) on CentOS 5 isn't supported, since it has a very old version (1.3.x) of iptables.
-  - Requires (iptables-persistent) package on Debian based systems.
-  - Supported distributions are Debian/Ubuntu, etc.., but any distribution that can install iptables-persistent, will load iptables rules from /etc/iptables.
+  - Supported distributions are Debian/Ubuntu, etc..,. For Debian based distributions, the iptables rules will be saved at /etc/iptables/rules.v4 and /etc/iptables/rules.v6
 author:
   - "Strahinja Kustudic (@kustodian)"
   - "Damir Markovic (@damirda)"
-  - "Allen Sanabria (@linuxdynasty)"
 '''
 
 EXAMPLES = '''
@@ -171,7 +168,7 @@ keep_unmanaged:
     sample: True
 '''
 
-import time, fcntl, lsb_release
+import time, fcntl
 
 try:
     from collections import defaultdict
@@ -277,23 +274,21 @@ class Iptables:
             return []
 
     #If /etc/debian_version exist, this means this is a debian based OS (Ubuntu, Mint, etc...)
-    def is_debian(self):
+    def _is_debian(self):
         return os.path.isfile('/etc/debian_version')
 
     # Get the iptables system save path.
     # Supports RHEL/CentOS '/etc/sysconfig/' location.
     # Supports Debian/Ubuntu/Mint,  '/etc/iptables/' location.
-    # In order to support Debian based distros, the user will need to install
-    # iptables-persistent.
     def _get_system_save_path(self, ipversion):
         # distro detection, path setting should be added
         if ipversion == '4':
-            if self.is_debian():
+            if self._is_debian():
                 return '/etc/iptables/rules.v4'
             else:
                 return '/etc/sysconfig/iptables'
         else:
-            if self.is_debian():
+            if self._is_debian():
                 return '/etc/iptables/rules.v6'
             else:
                 return '/etc/sysconfig/ip6tables'
@@ -320,12 +315,6 @@ class Iptables:
                     Iptables.module.fail_json(msg="This module isn't compatible with ip6tables versions older than 1.4.x")
         else:
             Iptables.module.fail_json(msg="Could not fetch iptables version! Is iptables installed?")
-
-    # Check if /etc/init.d/iptables-persistent for older Debian based systems
-    # Check if /etc/init.d/netfilter-persistent for newer Debian based systems
-        if self.is_debian():
-            if not os.path.isfile('/etc/init.d/netfilter-persistent') and not os.path.isfile('/etc/init.d/iptables-persistent'):
-                Iptables.module.fail_json(msg="Could not detect iptables-persistent package. Is iptables-persistent installed?")
 
     # Read rules from the json state file and return a dict.
     def _read_state_file(self):

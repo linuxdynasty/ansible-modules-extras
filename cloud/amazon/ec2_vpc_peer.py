@@ -399,7 +399,7 @@ def find_tags(client, resource_id, check_mode=False):
                 current_tags[i].pop('ResourceType')
                 current_tags[i].pop('ResourceId')
 
-    except botocore.exceptions.ClientError, e:
+    except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == 'DryRunOperation':
             success = True
             err_msg = e.message
@@ -510,7 +510,7 @@ def describe_peering_connections(client, vpc_id=None, vpc_peer_id=None,
         )
         success = True
 
-    except botocore.exceptions.ClientError, e:
+    except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == 'DryRunOperation':
             success = True
             err_msg = e.message
@@ -666,7 +666,7 @@ def tags_action(client, resource_id, tags, action='create', check_mode=False):
         else:
             err_msg = 'Invalid action {0}'.format(action)
 
-    except botocore.exceptions.ClientError, e:
+    except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == 'DryRunOperation':
             success = True
             err_msg = e.message
@@ -750,7 +750,7 @@ def update_routes(client, vpc_peering_id, cidr, route_table_ids,
             if completed.get('Return') == True:
                 success, changed = True, True
 
-        except botocore.exceptions.ClientError, e:
+        except botocore.exceptions.ClientError as e:
             err_msg = str(e)
             if e.response['Error']['Code'] == 'DryRunOperation':
                 success = True
@@ -972,7 +972,7 @@ def runner(client, state, params):
             err_msg = "Failure occured, please check aws console"
         result = convert_to_lower(result)
 
-    except botocore.exceptions.ClientError, e:
+    except botocore.exceptions.ClientError as e:
         if e.response['Error']['Code'] == 'DryRunOperation':
             success = True
             err_msg = e.message
@@ -1466,7 +1466,7 @@ def main():
                 region=region, endpoint=ec2_url, **aws_connect_kwargs
             )
         )
-    except botocore.exceptions.ClientError, e:
+    except botocore.exceptions.ClientError as e:
         err_msg = 'Boto3 Client Error - {0}'.format(str(e.msg))
         module.fail_json(msg=err_msg, **convert_to_lower(e.response))
 

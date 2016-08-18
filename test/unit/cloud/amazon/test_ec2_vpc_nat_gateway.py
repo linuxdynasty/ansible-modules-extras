@@ -152,6 +152,7 @@ class AnsibleEc2VpcNatGatewayFunctions(unittest.TestCase):
                 client, 'subnet-123456', 'eipalloc-1234567', check_mode=True
             )
         )
+        self.assertTrue('nat_gateway_id' in results)
         self.assertTrue(success)
         self.assertTrue(changed)
 
@@ -162,6 +163,7 @@ class AnsibleEc2VpcNatGatewayFunctions(unittest.TestCase):
                 client, 'subnet-123456', check_mode=True
             )
         )
+        self.assertTrue('nat_gateway_id' in results)
         self.assertTrue(success)
         self.assertTrue(changed)
 
@@ -172,6 +174,7 @@ class AnsibleEc2VpcNatGatewayFunctions(unittest.TestCase):
                 client, 'subnet-123456789', allocation_id='eipalloc-1234567', check_mode=True
             )
         )
+        self.assertTrue('nat_gateway_id' in results)
         self.assertTrue(success)
         self.assertFalse(changed)
 
@@ -182,6 +185,7 @@ class AnsibleEc2VpcNatGatewayFunctions(unittest.TestCase):
                 client, 'subnet-123456789', eip_address='55.55.55.55', check_mode=True
             )
         )
+        self.assertTrue('nat_gateway_id' in results)
         self.assertTrue(success)
         self.assertFalse(changed)
 
@@ -192,6 +196,7 @@ class AnsibleEc2VpcNatGatewayFunctions(unittest.TestCase):
                 client, 'subnet-123456789', if_exist_do_not_create=True, check_mode=True
             )
         )
+        self.assertTrue('nat_gateway_id' in results)
         self.assertTrue(success)
         self.assertFalse(changed)
 

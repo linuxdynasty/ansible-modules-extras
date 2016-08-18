@@ -768,19 +768,20 @@ def create(client, subnet_id, allocation_id, client_token=None,
             result = create_nat_gateway(client, params)
         else:
             result = DRY_RUN_GATEWAY_UNCONVERTED[0]
-            result['CreateTime'] = datetime.datetime.utcnow()
+            result['CreateTime'] = datetime.datetime.now(tzutc())
             result['NatGatewayAddresses'][0]['AllocationId'] = allocation_id
             result['SubnetId'] = subnet_id
 
         success = True
         changed = True
         create_time = result['CreateTime'].replace(tzinfo=None)
+        result = convert_to_lower(result)
         if token_provided and (request_time > create_time):
             changed = False
         elif wait:
             success, err_msg, result = (
                 wait_for_status(
-                    client, wait_timeout, result['NatGatewayId'], 'available',
+                    client, wait_timeout, result['nat_gateway_id'], 'available',
                     check_mode=check_mode
                 )
             )
